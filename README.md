@@ -3,6 +3,7 @@
 2) https://www.inform.kz/ru/ii-prihodit-v-shkolu-kak-iskusstvenniy-intellekt-menyaet-rabotu-uchitelya-i-uche-1931c2a6
 3) https://obuchai.com/blog/teacher-time-management-ai
 4) https://dtf.ru/howto/4822013-top-7-neyrosetey-dlya-uchiteley
+5) https://media.foxford.ru/news/teach-neyroseti-dlya-proverki-kontrolnyh
 
 
 Куда уходит больше всего времени
