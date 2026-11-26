@@ -1,7 +1,14 @@
-// CastChainSimplifyPass.cpp
+// FuseBroadcastIntoArithPass.cpp
+//
+// Устраняет полные broadcast-тензоры, сливая
+//   linalg.broadcast + arith.subf/mulf/addf
+// в единый linalg.generic. Устраняет источник temp_buffer,
+// из-за которого PlanMemory раздувает UB.
+
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/Tensor/IR/Tensor.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 
@@ -9,81 +16,124 @@ using namespace mlir;
 
 namespace {
 
-// Паттерн для поиска и свёртки замкнутой цепочки приведений.
-struct FoldClosedCastChain : public OpRewritePattern<arith::TruncFOp> {
+// Шаблон по типу arith-операции (SubFOp, MulFOp, AddFOp).
+template <typename ArithOp>
+struct FuseBroadcastIntoArith
+    : public OpRewritePattern<linalg::BroadcastOp> {
   using OpRewritePattern::OpRewritePattern;
 
-  LogicalResult matchAndRewrite(arith::TruncFOp truncOp,
+  LogicalResult matchAndRewrite(linalg::BroadcastOp bcast,
                                 PatternRewriter &rewriter) const override {
-    // 1. Проверяем, что результатом truncf является f16 (типичный конец цепочки).
-    auto resultType = dyn_cast<FloatType>(truncOp.getType());
-    if (!resultType || !resultType.isF16())
+    // Гарантия безопасности: broadcast имеет ровно одного пользователя.
+    Value bcastResult = bcast->getResult(0);
+    if (!bcastResult.hasOneUse()) return failure();
+
+    Operation *user = *bcastResult.getUsers().begin();
+    if (!isa<ArithOp>(user)) return failure();
+
+    // Какой операнд user'а — broadcast?
+    Value fullOperand;
+    bool bcastIsRhs;
+    if (user->getOperand(0) == bcastResult) {
+      fullOperand = user->getOperand(1);
+      bcastIsRhs = false;
+    } else if (user->getOperand(1) == bcastResult) {
+      fullOperand = user->getOperand(0);
+      bcastIsRhs = true;
+    } else {
       return failure();
+    }
 
-    // 2. Прослеживаем цепочку в обратном направлении: truncf <- i8 <- i32 <- f32
-    Value current = truncOp.getIn();
-    SmallVector<Operation *> chain;
-
-    // Шаг 2a: i8 -> f16 (ищем truncf из i8 в f16)
-    auto truncI8ToF16 = current.getDefiningOp<arith::TruncFOp>();
-    if (!truncI8ToF16 || !truncI8ToF16.getIn().getType().isInteger(8))
+    // Проверяем типы: только статические rank-1 + rank-N тензоры.
+    auto bcastType = dyn_cast<RankedTensorType>(bcastResult.getType());
+    auto srcType   = dyn_cast<RankedTensorType>(bcast.getInput().getType());
+    auto fullType  = dyn_cast<RankedTensorType>(fullOperand.getType());
+    if (!bcastType || !srcType || !fullType) return failure();
+    if (!bcastType.hasStaticShape() || !srcType.hasStaticShape())
       return failure();
-    chain.push_back(truncI8ToF16);
-    current = truncI8ToF16.getIn();
+    if (srcType.getRank() != 1) return failure();
+    if (bcastType.getRank() < 2) return failure();
 
-    // Шаг 2b: i32 -> i8 (ищем truncf из i32 в i8)
-    auto truncI32ToI8 = current.getDefiningOp<arith::TruncIOp>();
-    if (!truncI32ToI8 || !truncI32ToI8.getIn().getType().isInteger(32))
-      return failure();
-    chain.push_back(truncI32ToI8);
-    current = truncI32ToI8.getIn();
+    // Ищем, по какой оси шёл broadcast. Если размерностей несколько
+    // подходящих — не трогаем (маловероятный случай).
+    int64_t bcastDim = -1;
+    for (int64_t i = 0; i < bcastType.getRank(); ++i) {
+      if (bcastType.getShape()[i] == srcType.getShape()[0]) {
+        if (bcastDim != -1) return failure();
+        bcastDim = i;
+      }
+    }
+    if (bcastDim < 0) return failure();
 
-    // Шаг 2c: f32 -> i32 (ищем fptosi из f32 в i32)
-    auto fptosiF32ToI32 = current.getDefiningOp<arith::FPToSIOp>();
-    if (!fptosiF32ToI32 || !fptosiF32ToI32.getIn().getType().isF32())
-      return failure();
-    chain.push_back(fptosiF32ToI32);
-    Value originalF32 = fptosiF32ToI32.getIn();
+    // Строим linalg.generic: ins(%full, %src) outs(%empty)
+    Location loc = bcast.getLoc();
+    Value empty = rewriter.create<tensor::EmptyOp>(
+        loc, bcastType.getShape(), bcastType.getElementType());
 
-    // 3. Проверка безопасности: цепочка должна быть замкнутой, т.е. исходный
-    //    и конечный тип совпадают (f32 -> ... -> f32). В нашем случае это так,
-    //    но мы заменяем только конечный truncf, поэтому проверяем, что
-    //    originalF32 имеет тип f32.
-    if (!originalF32.getType().isF32())
-      return failure();
+    int64_t rank = bcastType.getRank();
+    SmallVector<AffineExpr> fullId, srcId;
+    for (int64_t i = 0; i < rank; ++i) {
+      fullId.push_back(rewriter.getAffineDimExpr(i));
+      if (i == bcastDim) srcId.push_back(rewriter.getAffineDimExpr(i));
+    }
+    auto fullMap = AffineMap::get(rank, 0, fullId, rewriter.getContext());
+    auto srcMap  = AffineMap::get(rank, 0, srcId,  rewriter.getContext());
 
-    // 4. Заменяем конечный truncf на исходное значение f32.
-    //    Это делает всю цепочку мёртвой, и DCE удалит промежуточные операции.
-    rewriter.replaceOp(truncOp, originalF32);
+    SmallVector<AffineMap> maps = {fullMap, srcMap, fullMap};
+    SmallVector<utils::IteratorType> iters(rank,
+                                            utils::IteratorType::parallel);
+
+    Value full = fullOperand;
+    Value src  = bcast.getInput();
+    bool isRhs = bcastIsRhs;
+
+    auto genericOp = rewriter.create<linalg::GenericOp>(
+        loc, TypeRange{bcastType}, ValueRange{full, src}, ValueRange{empty},
+        maps, iters,
+        [isRhs](OpBuilder &b, Location loc, ValueRange args) {
+          Value lhs = isRhs ? args[0] : args[1];
+          Value rhs = isRhs ? args[1] : args[0];
+          Value v = b.create<ArithOp>(loc, lhs, rhs);
+          b.create<linalg::YieldOp>(loc, v);
+        });
+
+    rewriter.replaceOp(user, genericOp.getResults());
+    rewriter.eraseOp(bcast);
     return success();
   }
 };
 
-// Пасс, работающий на уровне ModuleOp.
-struct CastChainSimplifyPass
-    : public PassWrapper<CastChainSimplifyPass, OperationPass<ModuleOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(CastChainSimplifyPass)
+struct FuseBroadcastIntoArithPass
+    : public PassWrapper<FuseBroadcastIntoArithPass, OperationPass<ModuleOp>> {
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseBroadcastIntoArithPass)
 
-  StringRef getArgument() const final { return "cast-chain-simplify"; }
-  StringRef getDescription() const final {
-    return "Fold closed f32->i32->i8->f16->f32 cast chains to reduce UB usage";
+  StringRef getArgument() const override {
+    return "fuse-broadcast-into-arith";
+  }
+  StringRef getDescription() const override {
+    return "Fuse linalg.broadcast into arith.subf/mulf/addf to remove "
+           "full-size broadcast temp_buffer";
   }
 
   void runOnOperation() override {
-    ModuleOp module = getOperation();
     RewritePatternSet patterns(&getContext());
-    // Добавляем паттерн. Можно также добавить канонические паттерны для arith.
-    patterns.add<FoldClosedCastChain>(&getContext());
-    // Применяем паттерны жадно, чтобы цепочки свёртывались до конца.
-    if (failed(applyPatternsGreedily(module, std::move(patterns)))) {
-        signalPassFailure();
+    patterns.add<FuseBroadcastIntoArith<arith::SubFOp>>(&getContext());
+    patterns.add<FuseBroadcastIntoArith<arith::MulFOp>>(&getContext());
+    patterns.add<FuseBroadcastIntoArith<arith::AddFOp>>(&getContext());
+    // applyPatternsGreedily — актуальный API в LLVM 21+, в отличие от
+    // устаревшего applyPatternsAndFoldGreedily.
+    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
+      signalPassFailure();
     }
   }
 };
 
 } // namespace
 
-// Фабричная функция для создания пасса.
-std::unique_ptr<Pass> createCastChainSimplifyPass() {
-  return std::make_unique<CastChainSimplifyPass>();
+std::unique_ptr<Pass> createFuseBroadcastIntoArithPass() {
+  return std::make_unique<FuseBroadcastIntoArithPass>();
+}
+
+void registerFuseBroadcastIntoArithPass() {
+  PassRegistration<FuseBroadcastIntoArithPass>();
 }
