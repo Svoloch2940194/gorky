@@ -1,73 +1,104 @@
-# gorky
-1) https://media.foxford.ru/news/teach-issledovanie-na-chto-uchitelya-tratyat-bolshe-vsego-vremeni
-2) https://www.inform.kz/ru/ii-prihodit-v-shkolu-kak-iskusstvenniy-intellekt-menyaet-rabotu-uchitelya-i-uche-1931c2a6
-3) https://obuchai.com/blog/teacher-time-management-ai
-4) https://dtf.ru/howto/4822013-top-7-neyrosetey-dlya-uchiteley
-5) https://media.foxford.ru/news/teach-neyroseti-dlya-proverki-kontrolnyh
+file(GLOB STANDARDIZE_OP_PASS_SRC CONFIGURE_DEPENDS
+  "StandardizeOp/*.cpp"
+)
+file(GLOB PLAN_COMPUTE_BLOCK_PASS_SRC CONFIGURE_DEPENDS
+  "PlanComputeBlock/*.cpp"
+)
+file(GLOB COMMON_SRC CONFIGURE_DEPENDS
+  "Common/*.cpp"
+)
+file(GLOB SPLIT_DATAFLOW_SRC_FILES CONFIGURE_DEPENDS
+    "SplitDataflow/*.cpp"
+)
+file(GLOB SEPARATE_MEMORY_FROM_COMPUTE_SRC_FILES CONFIGURE_DEPENDS
+  "SeparateMemoryFromCompute/*.cpp"
+)
 
-# оптимизация проверки
-• Перенос части домашних заданий на онлайн-платформы. Раз в неделю тренировочные упражнения по русскому языку, математике или окружающему миру можно задавать в Яндекс Учебнике, Учи.ру или МЭШ / РЭШ. Платформы сами проверяют задания, показывают детям подсказки и собирают для вас сводку, кто из учеников допустил ошибки.
-• Проверка фото работ через мультимодальные нейросети. Для 3–4 классов, где почерк уже более разборчивый, можно сфотографировать тетрадь (без фамилии ученика) и загрузить в ChatGPT или Claude с запросом: «Найди вычислительные ошибки в примерах на фото и объясни, на каком этапе ученик ошибся». Для прописей в 1–2 классах этот способ пока не подходит из-за особенностей детского почерка.
-• Генерация шаблонов обратной связи и разбора ошибок. После проверки контрольной выпишите 4–5 самых частых ошибок класса и попросите нейросеть (YandexGPT, GigaChat) составить короткую памятку-разбор для учеников и родителей или карточки для работы над ошибками на следующий урок.
+file(GLOB ALLOC_MULTI_CACHE_SRCS_FILES CONFIGURE_DEPENDS
+  "AllocMultiCache/*.cpp"
+)
 
+file(GLOB ADD_CONTROLFLOW_CONDITION_SRC_FILES CONFIGURE_DEPENDS
+    "AddControlFlowCondition/*.cpp"
+)
 
-## Почему проверка тетрадей 1–2 класса по фото не сработает
+file(GLOB Compute_BLOCK_OPT_SRC_FILES CONFIGURE_DEPENDS
+    "ComputeBlockOpt/*.cpp"
+    "ComputeBlockOpt/SplitIfByBlockId/*.cpp"
+)
 
-• Особенности детского почерка. В 1–2 классах дети ещё формируют навык письма: буквы «пляшут» по высоте, соединения бывают неверными (например, путаются и/ш, о/а, л/м), много зачёркиваний и грязи. Мультимодальные нейросети (ChatGPT, Claude, YandexGPT) часто додумывают слово по контексту, «исправляя» ошибку ребёнка при распознавании, или, наоборот, принимают неровную букву за неверную.
-• Затраты времени на съёмку. Сфотографировать 25–30 тетрадей, загрузить их, дождаться ответа и всё равно перепроверить за нейросетью займёт больше времени, чем быстрая ручная проверка с красной ручкой.
+file(GLOB ANALYZE_DATAFLOW_SRC_FILES CONFIGURE_DEPENDS
+    "AnalyzeDataFlow/*.cpp"
+)
 
+file(GLOB PRE_CHECK_AVAILABLE_SRC_FILES CONFIGURE_DEPENDS
+    "PreCheckAvailable/*.cpp"
+)
 
+add_triton_library(DynamicCVPipeline
+  RawBytePoolReusePass.cpp
+  EliminateBroadcastBufferPass.cpp
+  SinkBufferReadsPass.cpp
+  EliminateRedundantEmptyTensorsPass.cpp
+  OptimizeUBAllocationsPass.cpp
+  ReuseUBBuffersPass.cpp
+  HoistStaticAllocsPass.cpp
+  HoistReductionAcrossStagesPass.cpp
+  DumpTTAdapterPass.cpp
+  
+  AddDynamicCVPipeline.cpp
+  MainLoopUnroll.cpp
+  PreCheckAvailable.cpp
 
-# Куда уходит больше всего времени
+  StandardizeOp.cpp
+  ${STANDARDIZE_OP_PASS_SRC}
 
-По данным российских и международных исследований (включая опросы НИУ ВШЭ и исследование «Фоксфорда»), внеурочная нагрузка распределяется так:
+  PlanComputeBlock.cpp
+  ComputeBlockOptPass.cpp
+  AnalyzeDataFlow.cpp
+  ${PLAN_COMPUTE_BLOCK_PASS_SRC}
+  ${COMMON_SRC}
+  ${Compute_BLOCK_OPT_SRC_FILES}
+  ${ANALYZE_DATAFLOW_SRC_FILES}
+  ${PRE_CHECK_AVAILABLE_SRC_FILES}
+  SplitDataflow.cpp
+  SeparateMemoryFromComputePass.cpp
+  SeparateMemoryFromCompute/MarkGMLoadPass.cpp
+  AllocMultiCache.cpp
+  AddControlFlowCondition.cpp
+  ${PLAN_COMPUTE_BLOCK_SRC_FILES}
+  ${SPLIT_DATAFLOW_SRC_FILES}
+  ${SEPARATE_MEMORY_FROM_COMPUTE_SRC_FILES}
+  ${ALLOC_MULTI_CACHE_SRCS_FILES}
+  ${ADD_CONTROLFLOW_CONDITION_SRC_FILES}
+  RemoveAttributes.cpp
+  EstimateCVPipelineCost.cpp
 
-• Подготовка к занятиям (25–30% внеурочного времени). Поиск иллюстраций, составление поурочных планов, презентаций и раздаточных карточек.
+  DEPENDS
+  AddDynamicCVPipelinePassIncGen
 
-• Проверка тетрадей и тестов (20–25%). Рутинная сверка ответов, поиск типовых ошибок и выставление оценок.
+  LINK_LIBS
+  BiShengIRHIVMDialect
+  BiShengIRScopeDialect
+  BiShengIRAnnotationDialect
+  MLIRLinalgTransformOps
+  MLIRLinalgTransforms
+  MLIRSCFTransformOps
+  MLIRSCFTransforms
+  MLIRSCFUtils
+  MLIRTransformDialect
+  MLIRTransformDialectTransforms
+  MLIRTransforms
+)
 
-• Бюрократия и отчёты (15–20%). Заполнение рабочих программ, аналитических справок и дублирование оценок.
-
-# Что нельзя полностью отдавать нейросети
-
-• Финальную проверку фактов и оценок. ИИ может ошибаться в сложных расчётах, выдумывать факты или неправильно оценивать творческий ход мысли ученика.
-• Эмоциональную поддержку и разрешение конфликтов. Разговор с расстроенным ребёнком или напряжённый диалог с родителями требуют живой эмпатии, которую алгоритмы не заменят.
-
-
-
-Бюрократия и характеристики	Составляет черновики психолого-педагогических характеристик на учеников, сценарии классных часов, родительских собраний и отчёты по воспитательной работе.	Текстовые нейросети (GigaChat, YandexGPT, Claude).
-Первичная проверка заданий	Автоматически проверяет цифровые домашние задания и тесты по шаблону, собирая статистику, кто из детей какую тему не усвоил.	Образовательные платформы со встроенной автопроверкой.
-
-# промтики для модели
-Принято, буду ориентироваться на работу сразу со всей ступенью с 1 по 4 класс.
-Ниже собраны готовые сценарии и шаблоны промптов для ключевых задач, которые помогают разгрузить педагога в течение учебного года:
-
-1. Разноуровневые карточки и задания (математика, русский язык, окружающий мир)
-
-В каждом классе есть дети с разным темпом работы. Нейросеть (YandexGPT, GigaChat или ChatGPT) быстро адаптирует одно задание под три уровня сложности.
-• Как использовать: задайте тему урока и попросите создать карточки для базового, среднего и повышенного уровней.
-• Шаблон запроса:«Ты — опытный методист начальной школы. Составь 3 варианта карточки-пятиминутки по теме "[Название темы, например: Безударные гласные в корне слова]" для [номер] класса.
-Вариант 1 — базовый (с подсказкой-правилом и простыми словами).
-Вариант 2 — стандартный (по программе).
-Вариант 3 — повышенной сложности (с творческим заданием или ловушкой). Добавь ответы для быстрой проверки».
-
-2. Психолого-педагогические характеристики на учеников
-
-Написание характеристик для ПМПК, перевода или по итогам года занимает много времени, особенно когда нужно подобрать корректные формулировки для 25–30 детей.
-• Как использовать: перечислите тезисно особенности ребёнка (без указания фамилии и личных данных ради безопасности), и нейросеть соберёт связный официальный текст.
-• Шаблон запроса:«Напиши психолого-педагогическую характеристику на ученика [номер] класса в официально-деловом стиле. Исходные данные: [успеваемость по основным предметам], [темп работы на уроке], [особенности внимания и памяти], [отношения со сверстниками и реакция на замечания], [участие родителей]. Объём — 1500 знаков».
-
-3. Сценарии классных часов и родительских собраний
-
-В начальной школе много внеурочной активности, на которую уходит время по вечерам и выходным.
-• Как использовать: попросите составить поминутный план мероприятия с интерактивом, подходящим под возраст детей (7–8 лет для 1–2 классов или 9–10 лет для 3–4 классов).
-• Шаблон запроса:«Составь сценарий классного часа для [номер] класса на тему "[Тема, например: Правила безопасного поведения в интернете]" длительностью 40 минут. Включи разминку, 2 короткие игровые ситуации для обсуждения в группах и подведение итогов. Учитывай возрастные особенности детей и избегай сложных терминов».
-
-4. Иллюстрации и наглядные материалы
-
-Для оформления презентаций, раскрасок по теме урока или карточек со словарными словами подойдут генераторы изображений (Шедеврум или Кандинский).
-• Пример запроса для раскраски или карточки:«Чёрно-белая контурная раскраска для детей, толстые чёткие линии, без мелких деталей, белый фон: [объект, например: белочка с грибами в осеннем лесу]».
-Какую из этих задач хочется разобрать подробнее или адаптировать под ваш текущий учебный план:
-• Подготовку карточек и тренажёров по конкретному предмету
-• Автоматизацию характеристик и отчётов
-• Сценарии уроков и внеклассных мероприятий
+# EstimateCVPipelineCost reuses the costmodel's HardwareConfig + PipelineScheduler.
+# The costmodel is optional (TRITON_ASCEND_ENABLE_COSTMODEL_INPROC), so the pass
+# degrades to a no-op when it is not built. The parent CMakeLists configures the
+# costmodel before add_subdirectory(lib) so the target and headers are visible here.
+if(TRITON_ASCEND_HAS_INPROC_COSTMODEL)
+  add_dependencies(DynamicCVPipeline AscendModelOpsIncGen)
+  target_link_libraries(DynamicCVPipeline PUBLIC AscendModelAnalysis)
+  target_compile_definitions(DynamicCVPipeline PRIVATE TRITON_ASCEND_HAS_INPROC_COSTMODEL=1)
+else()
+  target_compile_definitions(DynamicCVPipeline PRIVATE TRITON_ASCEND_HAS_INPROC_COSTMODEL=0)
+endif()
