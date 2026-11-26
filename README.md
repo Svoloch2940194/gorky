@@ -1,152 +1,67 @@
 #include "mlir/Dialect/Linalg/IR/Linalg.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "mlir/IR/Dominance.h"
-#include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
-#include "llvm/ADT/DenseMap.h"
-#include "llvm/ADT/SmallVector.h"
 
 using namespace mlir;
 
 namespace {
 
-/// Проверяет, используется ли тензор только как временный буфер (outs)
-/// в операциях, которые полностью перезаписывают его перед чтением,
-/// либо вообще не имеет читателей (мертвый код).
-static bool isDeadTensor(Value val) {
-  for (OpOperand &use : val.getUses()) {
-    Operation *owner = use.getOwner();
-    // Если результат передается в linalg.fill, проверяем пользователей самого fill
-    if (auto fillOp = dyn_cast<linalg::FillOp>(owner)) {
-      if (use.getOperandNumber() == 1) { // outs operand
-        if (!isDeadTensor(fillOp.getResult(0)))
-          return false;
-        continue;
-      }
-    }
-    // Любое другое использование означает, что тензор живой
-    return false;
-  }
-  return true;
-}
-
-/// Удаляет мертвые linalg.fill и tensor.empty снизу вверх
-static void eraseDeadEmptyChain(tensor::EmptyOp emptyOp) {
-  SmallVector<Operation *> toErase;
-  for (OpOperand &use : emptyOp->getUses()) {
-    if (auto fillOp = dyn_cast<linalg::FillOp>(use.getOwner())) {
-      toErase.push_back(fillOp);
-    }
-  }
-  for (Operation *op : toErase) {
-    op->erase();
-  }
-  emptyOp->erase();
-}
-
-struct EliminateRedundantEmptyTensorsPass
-    : public PassWrapper<EliminateRedundantEmptyTensorsPass,
+class SplitSyncBufferLifetimePass
+    : public PassWrapper<SplitSyncBufferLifetimePass,
                          OperationPass<ModuleOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(
-      EliminateRedundantEmptyTensorsPass)
+public:
+  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(SplitSyncBufferLifetimePass)
 
   StringRef getArgument() const final {
-    return "eliminate-redundant-empty-tensors";
+    return "hivm-split-sync-buffer-lifetime";
   }
-
   StringRef getDescription() const final {
-    return "Удаляет мертвые tensor.empty и переиспользует дублирующиеся "
-           "аллокации одного типа в пределах ModuleOp";
-  }
-
-  void getDependentDialects(DialectRegistry &registry) const override {
-    registry.insert<tensor::TensorDialect, linalg::LinalgDialect>();
+    return "Localizes shared tensor.empty outs in transpose/broadcast and "
+           "sinks broadcast in ssbuffer.if=19 to save 32-64KB UB.";
   }
 
   void runOnOperation() override {
     ModuleOp module = getOperation();
 
-    // Шаг 1: Удаление мертвых tensor.empty и связанных с ними linalg.fill по всему модулю
-    SmallVector<tensor::EmptyOp> deadEmpties;
-    module.walk([&](tensor::EmptyOp emptyOp) {
-      if (isDeadTensor(emptyOp.getResult())) {
-        deadEmpties.push_back(emptyOp);
-      }
-    });
-
-    for (tensor::EmptyOp dead : deadEmpties) {
-      eraseDeadEmptyChain(dead);
-    }
-
-    // Шаг 2: Дедупликация tensor.empty в пределах каждого базового блока (Block)
-    module.walk([&](Block *block) {
-      DenseMap<Type, tensor::EmptyOp> canonicalEmpties;
-      SmallVector<tensor::EmptyOp> duplicatesToErase;
-
-      for (Operation &op : *block) {
-        auto emptyOp = dyn_cast<tensor::EmptyOp>(&op);
-        if (!emptyOp)
-          continue;
-
-        RankedTensorType tensorType = emptyOp.getType();
-        if (!tensorType.hasStaticShape())
-          continue;
-
-        auto it = canonicalEmpties.find(tensorType);
-        if (it == canonicalEmpties.end()) {
-          canonicalEmpties[tensorType] = emptyOp;
-        } else {
-          tensor::EmptyOp masterEmpty = it->second;
-          emptyOp.getResult().replaceAllUsesWith(masterEmpty.getResult());
-          duplicatesToErase.push_back(emptyOp);
-        }
-      }
-
-      for (tensor::EmptyOp dup : duplicatesToErase) {
-        dup->erase();
-      }
-    });
-
-    // Шаг 3: Переиспользование доминирующих tensor.empty между вложенными регионами
-    // Обрабатываем каждую операцию с IsolatedFromAbove (например, func.func или hivm kernel)
-    // отдельно, так как SSA-значения не пересекают границы IsolatedFromAbove.
-    module.walk([&](Operation *isolatedOp) {
-      if (!isolatedOp->hasTrait<OpTrait::IsIsolatedFromAbove>() ||
-          isa<ModuleOp>(isolatedOp))
+    // 1. Заменяем общий %60 (tensor.empty) в linalg.transpose на локальный tensor.empty()
+    // перед каждым transpose — это освобождает 32 КБ (128x128xf16), удерживаемые через весь цикл!
+    module.walk([&](linalg::TransposeOp transposeOp) {
+      Value init = transposeOp.getInit();
+      auto initType = dyn_cast<RankedTensorType>(init.getType());
+      if (!initType)
         return;
 
-      DominanceInfo domInfo(isolatedOp);
-      SmallVector<tensor::EmptyOp> regionEmpties;
+      if (init.getParentBlock() != transposeOp->getBlock() || !init.hasOneUse()) {
+        OpBuilder builder(transposeOp);
+        auto localEmpty = builder.create<tensor::EmptyOp>(
+            transposeOp.getLoc(), initType.getShape(), initType.getElementType());
+        transposeOp.getInitMutable().assign(localEmpty.getResult());
+      }
+    });
 
-      isolatedOp->walk([&](tensor::EmptyOp op) {
-        if (op.getType().hasStaticShape())
-          regionEmpties.push_back(op);
-      });
+    // 2. В ssbuffer.if = 19 опускаем каждый linalg.broadcast прямо перед arith.mulf
+    module.walk([&](scf::IfOp ifOp) {
+      auto ssAttr = ifOp->getAttrOfType<IntegerAttr>("ssbuffer.if");
+      if (!ssAttr || ssAttr.getInt() != 19)
+        return;
 
-      for (size_t i = 0; i < regionEmpties.size(); ++i) {
-        tensor::EmptyOp opA = regionEmpties[i];
-        if (!opA || !opA->getBlock())
+      Block &thenBlock = ifOp.getThenRegion().front();
+      SmallVector<linalg::BroadcastOp> bcasts;
+      for (Operation &op : thenBlock) {
+        if (auto bcast = dyn_cast<linalg::BroadcastOp>(&op))
+          bcasts.push_back(bcast);
+      }
+
+      for (linalg::BroadcastOp bcast : bcasts) {
+        if (!bcast->hasOneUse())
           continue;
-
-        for (size_t j = i + 1; j < regionEmpties.size(); ++j) {
-          tensor::EmptyOp opB = regionEmpties[j];
-          if (!opB || !opB->getBlock())
-            continue;
-
-          if (opA.getType() == opB.getType()) {
-            if (domInfo.dominates(opA.getOperation(), opB.getOperation())) {
-              opB.getResult().replaceAllUsesWith(opA.getResult());
-              opB->erase();
-              regionEmpties[j] = nullptr;
-            } else if (domInfo.dominates(opB.getOperation(),
-                                         opA.getOperation())) {
-              opA.getResult().replaceAllUsesWith(opB.getResult());
-              opA->erase();
-              regionEmpties[i] = nullptr;
-              break;
-            }
-          }
+        Operation *user = *bcast->getUsers().begin();
+        if (user->getBlock() == &thenBlock && bcast->isBeforeInBlock(user)) {
+          bcast->moveBefore(user);
         }
       }
     });
@@ -155,8 +70,6 @@ struct EliminateRedundantEmptyTensorsPass
 
 } // namespace
 
-std::unique_ptr<Pass> createEliminateRedundantEmptyTensorsPass() {
-  return std::make_unique<EliminateRedundantEmptyTensorsPass>();
+std::unique_ptr<Pass> createSplitSyncBufferLifetimePass() {
+  return std::make_unique<SplitSyncBufferLifetimePass>();
 }
-
-static PassRegistration<EliminateRedundantEmptyTensorsPass> regPass;
