@@ -1,139 +1,256 @@
-// FuseBroadcastIntoArithPass.cpp
-//
-// Устраняет полные broadcast-тензоры, сливая
-//   linalg.broadcast + arith.subf/mulf/addf
-// в единый linalg.generic. Устраняет источник temp_buffer,
-// из-за которого PlanMemory раздувает UB.
+/*
+ * Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ * THE SOFTWARE.
+ */
 
-#include "mlir/Dialect/Arith/IR/Arith.h"
-#include "mlir/Dialect/Linalg/IR/Linalg.h"
-#include "mlir/Dialect/Tensor/IR/Tensor.h"
+#include <memory>
+
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/Support/Debug.h"
+
+#include "mlir/IR/IRMapping.h"
+#include "mlir/Dialect/MemRef/IR/MemRef.h"
+
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Utils/Utils.h"
 #include "mlir/IR/BuiltinOps.h"
-#include "mlir/Pass/Pass.h"
-#include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+#include "mlir/IR/Diagnostics.h"
+#include "mlir/Pass/PassManager.h"
+
+#include "ascend/include/DynamicCVPipeline/Common/Utils.h"
+#include "ascend/include/DynamicCVPipeline/ComputeBlockOptPass.h"
+#include "ascend/include/DynamicCVPipeline/MainLoopUnroll.h"
+#include "ascend/include/DynamicCVPipeline/PlanComputeBlockPass.h"
+#include "ascend/include/DynamicCVPipeline/PreCheckAvailable.h"
+#include "ascend/include/DynamicCVPipeline/SplitDataflowPass.h"
+#include "ascend/include/DynamicCVPipeline/StandardizeOp.h"
+
+#include <iostream>
+
+static constexpr const char *DEBUG_TYPE = "main-loop-unroll";
+#define DBGS() (llvm::dbgs() << '[' << DEBUG_TYPE << "] ")
+#define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
 using namespace mlir;
+using namespace mlir::triton;
 
 namespace {
 
-// Шаблон по типу arith-операции (SubFOp, MulFOp, AddFOp).
-template <typename ArithOp>
-struct FuseBroadcastIntoArith
-    : public OpRewritePattern<linalg::BroadcastOp> {
-  using OpRewritePattern::OpRewritePattern;
+// Temporary tag put on every scf.for before probing, so that a main loop found
+// in the probe clone can be matched back to the loop of the real module. It is
+// always removed before the pass returns.
+constexpr llvm::StringLiteral kMainLoopProbe = "ssbuffer.main_loop_probe";
 
-  LogicalResult matchAndRewrite(linalg::BroadcastOp bcast,
-                                PatternRewriter &rewriter) const override {
-    // Гарантия безопасности: broadcast имеет ровно одного пользователя.
-    Value bcastResult = bcast->getResult(0);
-    if (!bcastResult.hasOneUse()) return failure();
+class MainLoopUnrollPass
+    : public ::impl::MainLoopUnrollBase<MainLoopUnrollPass> {
+public:
+  explicit MainLoopUnrollPass(const MainLoopUnrollOptions &options)
+      : MainLoopUnrollBase(options) {}
 
-    Operation *user = *bcastResult.getUsers().begin();
-    if (!isa<ArithOp>(user)) return failure();
+  void runOnOperation() override;
 
-    // Какой операнд user'а — broadcast?
-    Value fullOperand;
-    bool bcastIsRhs;
-    if (user->getOperand(0) == bcastResult) {
-      fullOperand = user->getOperand(1);
-      bcastIsRhs = false;
-    } else if (user->getOperand(1) == bcastResult) {
-      fullOperand = user->getOperand(0);
-      bcastIsRhs = true;
-    } else {
-      return failure();
+private:
+  // Run, on a throw-away clone, the passes that materialize the cube <-> vector
+  // communication and mark the main loop. Returns the probe tags of the loops
+  // `mark-main-loop` marked there.
+  FailureOr<llvm::DenseSet<int>> probeMainLoops(ModuleOp module);
+
+};
+
+FailureOr<llvm::DenseSet<int>> MainLoopUnrollPass::probeMainLoops(
+    ModuleOp module) {
+  // Create new MLIRContext
+  MLIRContext *oldCtx = &getContext();
+  MLIRContext newCtx;
+  newCtx.allowUnregisteredDialects(oldCtx->allowsUnregisteredDialects());
+  newCtx.appendDialectRegistry(oldCtx->getDialectRegistry());
+  newCtx.loadAllAvailableDialects();
+  newCtx.disableMultithreading();
+
+  // Create module clone
+  OpBuilder builder(&newCtx);
+  OwningOpRef<ModuleOp> probe = builder.create<ModuleOp>(module->getLoc());
+  probe->getOperation()->setAttrs(module->getAttrDictionary());
+  IRMapping mapper;
+  for (auto &op : module->getRegion(0).front().getOperations()) {
+      probe->getBody()->push_back(op.clone(mapper));
+  }
+  
+  // These are the very passes SplitDataflow runs: the main loop is the loop
+  // that ends up carrying the inter core transfers, so it can only be found
+  // once those transfers have been inserted.
+  PassManager pm(&newCtx);
+  pm.addPass(createPreCheckAvailablePass());
+  pm.addPass(createStandardizeOpPass());
+  pm.addPass(createPlanComputeBlockPass());
+  pm.addPass(createComputeBlockOptPass());
+  pm.addPass(createSplitDataflowReducedPass());
+
+  // Diagnostics of the probe run point at a module that is about to be thrown
+  // away, so they would only confuse; a failure is reported by the caller.
+  if (failed(pm.run(*probe))) {
+    std::cout << "[VDV DEBUG] MainLoopUnroll pass - preliminary passes failed" << std::endl;
+    LDBG("MainLoopUnrollPass failed!\n");
+    return failure();
+  }
+  llvm::DenseSet<int> mainLoopTags;
+  probe->walk([&](scf::ForOp forOp) {
+    if (!forOp->hasAttr(CVPipeline::kMainLoop)) {
+      return;
+    }
+    if (auto tag = forOp->getAttrOfType<IntegerAttr>(kMainLoopProbe)) {
+      mainLoopTags.insert(static_cast<int>(tag.getInt()));
+    }
+  });
+  return mainLoopTags;
+}
+
+void MainLoopUnrollPass::runOnOperation() {
+  ModuleOp module = getOperation();
+  const int factor = this->unrollFactor;
+
+  if (factor <= 1) {
+    LDBG("Unroll factor <= 1, nothing to do");
+    return;
+  }
+
+  if (CVPipeline::hasFallbackAttr(module)) {
+    return;
+  }
+
+  Builder builder(module.getContext());
+  int probeTag = 0;
+  module.walk([&](scf::ForOp forOp) {
+    forOp->setAttr(kMainLoopProbe, builder.getI32IntegerAttr(probeTag++));
+  });
+  if (probeTag == 0) {
+    LDBG("Module has no loop, nothing to unroll");
+    return;
+  }
+  auto removeTags = llvm::make_scope_exit([&]() {
+    module.walk([](scf::ForOp forOp) { /*forOp->removeAttr(kMainLoopProbe);*/ });
+  });
+
+  auto mainLoopTags = probeMainLoops(module);
+  if (failed(mainLoopTags)) {
+    module->emitWarning()
+        << "[" << DEBUG_TYPE << "] "
+        << "Could not determine the main loop, skipping the unroll by "
+        << factor << ".";
+    return;
+  }
+  if (mainLoopTags->empty()) {
+    LDBG("No main loop found, nothing to unroll");
+    return;
+  }
+
+  SmallVector<scf::ForOp> mainLoops;
+  module.walk([&](scf::ForOp forOp) {
+    auto tag = forOp->getAttrOfType<IntegerAttr>(kMainLoopProbe);
+    if (tag && mainLoopTags->contains(static_cast<int>(tag.getInt()))) {
+      mainLoops.push_back(forOp);
+    }
+  });
+
+  for (scf::ForOp forOp : mainLoops) {
+    mlir::IRMapping beforeMapper;
+    LDBG("Unrolling main loop by " << factor);
+    auto before = forOp->clone(beforeMapper);
+    llvm::SmallVector<mlir::Value, 4> allocBuffers;
+
+    before->walk([&](mlir::memref::AllocOp allocOp) {
+      mlir::Value allocatedValueInClone = allocOp.getResult();
+        for (auto& pair : beforeMapper.getValueMap()) {
+            if (pair.second == allocatedValueInClone) {
+                allocBuffers.push_back(pair.first);
+                break;
+            }
+        }
+    });
+
+    before->erase();
+
+
+    auto unrolled = mlir::loopUnrollByFactor(
+        forOp, static_cast<uint64_t>(factor));
+
+    mlir::IRMapping afterMapper;
+    auto after = forOp->clone(afterMapper);
+    llvm::SmallVector<mlir::Value, 4> allowedBuffersInAfter;
+    for (mlir::Value valBefore : allocBuffers) {
+        mlir::Value valAfter = afterMapper.lookupOrNull(valBefore);
+        if (valAfter) {
+            allowedBuffersInAfter.push_back(valAfter);
+        }
     }
 
-    // Проверяем типы: только статические rank-1 + rank-N тензоры.
-    auto bcastType = dyn_cast<RankedTensorType>(bcastResult.getType());
-    auto srcType   = dyn_cast<RankedTensorType>(bcast.getInput().getType());
-    auto fullType  = dyn_cast<RankedTensorType>(fullOperand.getType());
-    if (!bcastType || !srcType || !fullType) return failure();
-    if (!bcastType.hasStaticShape() || !srcType.hasStaticShape())
-      return failure();
-    if (srcType.getRank() != 1) return failure();
-    if (bcastType.getRank() < 2) return failure();
+    llvm::SmallVector<mlir::Operation*, 4> allocsToRemove;
+    size_t bufferIndex = 0;
 
-    // Ищем, по какой оси шёл broadcast. Если размерностей несколько
-    // подходящих — не трогаем (маловероятный случай).
-    int64_t bcastDim = -1;
-    for (int64_t i = 0; i < bcastType.getRank(); ++i) {
-      if (bcastType.getShape()[i] == srcType.getShape()[0]) {
-        if (bcastDim != -1) return failure();
-        bcastDim = i;
+    after->walk([&](mlir::memref::AllocOp allocOpAfter) {
+      mlir::Value valueAfter = allocOpAfter.getResult();
+      
+      bool isAllowed = llvm::is_contained(allowedBuffersInAfter, valueAfter);
+
+      if (!isAllowed) {
+          if (!allowedBuffersInAfter.empty()) {
+            mlir::Value backupValue = allowedBuffersInAfter[bufferIndex];
+            
+            bufferIndex = (bufferIndex + 1) % allowedBuffersInAfter.size();
+
+            LDBG("Cyclically replacing new alloc with existing buffer at index " << bufferIndex);
+            
+            valueAfter.replaceAllUsesWith(backupValue);
+            allocsToRemove.push_back(allocOpAfter.getOperation());
+        } else {
+            forOp->emitWarning() << "allocBuffers is empty! Nowhere to redirect uses.";
+        }
       }
+    });
+
+    for (mlir::Operation* op : allocsToRemove) {
+      LDBG("Removing new alloc operation: " << *op);
+      op->erase();
     }
-    if (bcastDim < 0) return failure();
 
-    // Строим linalg.generic: ins(%full, %src) outs(%empty)
-    Location loc = bcast.getLoc();
-    Value empty = rewriter.create<tensor::EmptyOp>(
-        loc, bcastType.getShape(), bcastType.getElementType());
+    mlir::IRRewriter rewriter(forOp->getContext());
+    rewriter.setInsertionPoint(forOp);
+    rewriter.insert(after);
+    rewriter.replaceOp(forOp, after->getResults());
+    forOp = mlir::cast<scf::ForOp>(after);
 
-    int64_t rank = bcastType.getRank();
-    SmallVector<AffineExpr> fullId, srcId;
-    for (int64_t i = 0; i < rank; ++i) {
-      fullId.push_back(rewriter.getAffineDimExpr(i));
-      if (i == bcastDim) srcId.push_back(rewriter.getAffineDimExpr(i));
-    }
-    auto fullMap = AffineMap::get(rank, 0, fullId, rewriter.getContext());
-    auto srcMap  = AffineMap::get(rank, 0, srcId,  rewriter.getContext());
-
-    SmallVector<AffineMap> maps = {fullMap, srcMap, fullMap};
-    SmallVector<utils::IteratorType> iters(rank,
-                                            utils::IteratorType::parallel);
-
-    Value full = fullOperand;
-    Value src  = bcast.getInput();
-    bool isRhs = bcastIsRhs;
-
-    auto genericOp = rewriter.create<linalg::GenericOp>(
-        loc, TypeRange{bcastType}, ValueRange{full, src}, ValueRange{empty},
-        maps, iters,
-        [isRhs](OpBuilder &b, Location loc, ValueRange args) {
-          Value lhs = isRhs ? args[0] : args[1];
-          Value rhs = isRhs ? args[1] : args[0];
-          Value v = b.create<ArithOp>(loc, lhs, rhs);
-          b.create<linalg::YieldOp>(loc, v);
-        });
-
-    rewriter.replaceOp(user, genericOp.getResults());
-    rewriter.eraseOp(bcast);
-    return success();
-  }
-};
-
-struct FuseBroadcastIntoArithPass
-    : public PassWrapper<FuseBroadcastIntoArithPass, OperationPass<ModuleOp>> {
-  MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(FuseBroadcastIntoArithPass)
-
-  StringRef getArgument() const override {
-    return "fuse-broadcast-into-arith";
-  }
-  StringRef getDescription() const override {
-    return "Fuse linalg.broadcast into arith.subf/mulf/addf to remove "
-           "full-size broadcast temp_buffer";
-  }
-
-  void runOnOperation() override {
-    RewritePatternSet patterns(&getContext());
-    patterns.add<FuseBroadcastIntoArith<arith::SubFOp>>(&getContext());
-    patterns.add<FuseBroadcastIntoArith<arith::MulFOp>>(&getContext());
-    patterns.add<FuseBroadcastIntoArith<arith::AddFOp>>(&getContext());
-    // applyPatternsGreedily — актуальный API в LLVM 21+, в отличие от
-    // устаревшего applyPatternsAndFoldGreedily.
-    if (failed(applyPatternsGreedily(getOperation(), std::move(patterns)))) {
-      signalPassFailure();
+    forOp->dump(); 
+    if (failed(unrolled)) {
+      // Unrolling is an optimization: keep the original loop and go on.
+      forOp->emitWarning() << "[" << DEBUG_TYPE << "] "
+                           << "Failed to unroll the main loop by " << factor
+                           << ", keeping it as is.";
+      continue;
     }
   }
-};
+}
 
 } // namespace
 
-std::unique_ptr<Pass> createFuseBroadcastIntoArithPass() {
-  return std::make_unique<FuseBroadcastIntoArithPass>();
-}
-
-void registerFuseBroadcastIntoArithPass() {
-  PassRegistration<FuseBroadcastIntoArithPass>();
+std::unique_ptr<OperationPass<ModuleOp>>
+mlir::triton::createMainLoopUnrollPass(const MainLoopUnrollOptions &options) {
+  return std::make_unique<MainLoopUnrollPass>(options);
 }
